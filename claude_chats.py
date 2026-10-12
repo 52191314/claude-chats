@@ -613,7 +613,7 @@ def unhide_all_sessions():
     console.print(f"[bold green]Done! Patched {count} sessions to 'cli' entrypoint.[/bold green]\n")
 
 
-def list_table(show_all=False, query=""):
+def list_table(show_all=False, query="", limit=50):
     """Displays non-interactive tabular list of conversations."""
     sessions = query_sessions(show_all=show_all, query=query)
     if not sessions:
@@ -621,11 +621,13 @@ def list_table(show_all=False, query=""):
         return
 
     mode_str = "All Sessions (incl. SDK)" if show_all else "Main CLI Sessions"
-    console.print(f"\n[bold magenta]Claude Code Sessions[/bold magenta] [dim]({len(sessions)} total | {mode_str})[/dim]")
+    displayed = sessions if (limit <= 0 or limit >= len(sessions)) else sessions[:limit]
+    limit_note = f" | Showing {len(displayed)} of {len(sessions)}" if len(displayed) < len(sessions) else ""
+    console.print(f"\n[bold magenta]Claude Code Sessions[/bold magenta] [dim]({len(sessions)} total | {mode_str}{limit_note})[/dim]")
     console.print(f"{BOLD}{CYAN}{'#':<4} {'ACTIVE':<12} {'STATUS':<9} {'MODEL':<12} {'COST':<8} {'DIRECTORY':<22} {'PROMPT / SESSION ID'}{RESET}")
     console.print(f"{GRAY}{'─'*4} {'─'*12} {'─'*9} {'─'*12} {'─'*8} {'─'*22} {'─'*45}{RESET}")
 
-    for idx, s in enumerate(sessions[:50], 1):
+    for idx, s in enumerate(displayed, 1):
         rel_time = format_relative_time(s["mtime"])
         status = f"{RED}HIDDEN{RESET}" if s["entrypoint"] == "sdk-cli" else f"{GREEN}VISIBLE{RESET}"
         cost_disp = f"${s['total_cost']:.2f}" if s["total_cost"] > 0 else "-"
@@ -743,24 +745,57 @@ def run_fzf_tui(initial_query="", show_all=False):
             return
 
 
-def run_rich_interactive_menu(initial_query="", show_all=False):
+def run_rich_interactive_menu(initial_query="", show_all=False, initial_limit=25):
     """Fallback interactive TUI using Rich when fzf is not installed."""
     current_show_all = show_all
     query = initial_query
+    display_limit = initial_limit
 
     while True:
         sessions = query_sessions(show_all=current_show_all, query=query)
-        if not sessions and not current_show_all:
+        if not sessions and not current_show_all and not query:
             current_show_all = True
             sessions = query_sessions(show_all=True, query=query)
 
-        display_limit = 25
-        displayed = sessions[:display_limit]
+        # Handle zero matching sessions
+        if not sessions:
+            mode_desc = "[yellow]All Sessions (incl. SDK)[/yellow]" if current_show_all else "[green]Main CLI Sessions[/green]"
+            console.print(f"\n[bold magenta]Claude Code Sessions[/bold magenta] [dim](0 total | {mode_desc})[/dim]")
+            if query:
+                console.print(f"\n[yellow]No sessions found matching filter '[bold cyan]{query}[/bold cyan]'.[/yellow]")
+                console.print("\n[bold yellow]Actions:[/bold yellow]")
+                console.print("  - Type [bold cyan]c[/bold cyan] or [bold cyan]/[/bold cyan] (then Enter) to [bold green]clear search filter[/bold green]")
+                console.print("  - Type [bold magenta]a[/bold magenta] to toggle SDK sessions")
+                console.print("  - Type [bold cyan]/<text>[/bold cyan] to search another term")
+                console.print("  - Press [bold red]Enter[/bold red] to exit")
+            else:
+                console.print("[yellow]No Claude Code sessions found on this machine.[/yellow]")
+                return
+
+            try:
+                choice = input("\nSelect > ").strip()
+            except (KeyboardInterrupt, EOFError):
+                return
+            if not choice:
+                return
+            if choice.lower() in ("c", "clear") or choice == "/":
+                query = ""
+                continue
+            if choice.startswith("/"):
+                query = choice[1:].strip()
+                continue
+            if choice.lower() == "a":
+                current_show_all = not current_show_all
+                continue
+            continue
+
+        displayed = sessions if (display_limit <= 0 or display_limit >= len(sessions)) else sessions[:display_limit]
 
         mode_desc = "[yellow]All Sessions (incl. SDK)[/yellow]" if current_show_all else "[green]Main CLI Sessions[/green]"
         query_desc = f" | Filter: '[cyan]{query}[/cyan]'" if query else ""
+        limit_desc = f" | Showing {len(displayed)} of {len(sessions)}" if len(displayed) < len(sessions) else ""
         table = Table(
-            title=f"Claude Code Sessions ({len(sessions)} total | {mode_desc}{query_desc})",
+            title=f"Claude Code Sessions ({len(sessions)} total | {mode_desc}{query_desc}{limit_desc})",
             header_style="bold magenta",
             show_lines=False
         )
@@ -799,7 +834,9 @@ def run_rich_interactive_menu(initial_query="", show_all=False):
         console.print("\n[bold yellow]Actions:[/bold yellow]")
         console.print(f"  - Enter [bold green]1-{len(displayed)}[/bold green] to cd & resume session")
         console.print("  - [bold cyan]p <#>[/bold cyan] Preview details  |  [bold cyan]t <#>[/bold cyan] Full transcript  |  [bold cyan]y <#>[/bold cyan] Copy ID")
-        console.print("  - [bold magenta]/<text>[/bold magenta] Search filter    |  [bold magenta]a[/bold magenta] Toggle SDK chats  |  [bold magenta]u[/bold magenta] Unhide all in Claude")
+        more_hint = f"  |  [bold magenta]m[/bold magenta] More (+25)" if len(sessions) > len(displayed) else ""
+        console.print(f"  - [bold magenta]/<text>[/bold magenta] Search filter    |  [bold magenta]a[/bold magenta] Toggle SDK chats{more_hint}")
+        console.print("  - [bold magenta]n <#>[/bold magenta] Change limit (e.g. 'n 50' or 'n all')  |  [bold magenta]u[/bold magenta] Unhide all in Claude")
         console.print("  - Press [bold red]Enter[/bold red] to exit")
 
         try:
@@ -809,6 +846,24 @@ def run_rich_interactive_menu(initial_query="", show_all=False):
 
         if not choice:
             return
+
+        # Pagination & limit commands
+        if choice.lower() in ("m", "more"):
+            display_limit += 25
+            continue
+        if choice.lower() in ("m all", "more all"):
+            display_limit = len(sessions)
+            continue
+        if choice.lower() in ("c", "clear"):
+            query = ""
+            continue
+        if choice.lower().startswith("n "):
+            val = choice[2:].strip().lower()
+            if val in ("all", "0"):
+                display_limit = len(sessions)
+            elif val.isdigit():
+                display_limit = max(1, int(val))
+            continue
 
         # Search filter
         if choice.startswith("/"):
@@ -855,6 +910,31 @@ def run_rich_interactive_menu(initial_query="", show_all=False):
 
 
 def main():
+    # Normalize Windows-style flags (/l, /a, /c, /u, /h, /?, /n:50) and strip leading / from queries
+    raw_args = sys.argv[1:]
+    normalized_args = []
+    for a in raw_args:
+        if a.lower() in ("/l", "/list"):
+            normalized_args.append("-l")
+        elif a.lower() in ("/a", "/all"):
+            normalized_args.append("-a")
+        elif a.lower() in ("/c", "/last", "/continue"):
+            normalized_args.append("-c")
+        elif a.lower() in ("/u", "/unhide"):
+            normalized_args.append("-u")
+        elif a.lower() in ("/h", "/help", "/?"):
+            normalized_args.append("-h")
+        elif a.lower().startswith("/n:"):
+            normalized_args.extend(["-n", a[3:]])
+        elif a.lower() in ("csess", "/csess", "claude-chats", "/claude-chats"):
+            # Avoid filtering on own command/alias name
+            pass
+        elif a.startswith("/") and len(a) > 1 and not a.startswith("//"):
+            # If user passed /searchterm on CLI, treat as searchterm
+            normalized_args.append(a[1:])
+        else:
+            normalized_args.append(a)
+
     parser = argparse.ArgumentParser(
         description="Interactive TUI and fuzzy search browser for Claude Code sessions."
     )
@@ -892,12 +972,28 @@ def main():
         help="Unhide all SDK sessions so Claude Code's native /resume displays them"
     )
     parser.add_argument(
+        "-n", "--limit", "--count",
+        dest="limit",
+        default="25",
+        help="Number of sessions to show (e.g. 50, 100, or 'all', default: 25)"
+    )
+    parser.add_argument(
         "--preview",
         metavar="SID",
         help=argparse.SUPPRESS  # Internal flag for fzf preview
     )
 
-    args = parser.parse_args()
+    args = parser.parse_args(normalized_args)
+
+    # Parse limit value
+    limit_val = 25
+    if str(args.limit).lower() in ("all", "0", "-1"):
+        limit_val = 0
+    else:
+        try:
+            limit_val = max(1, int(args.limit))
+        except ValueError:
+            limit_val = 25
 
     # Clear residual resume command script on new run
     if os.path.exists(RESUME_CMD_FILE):
@@ -929,7 +1025,7 @@ def main():
 
     # Direct list
     if args.list:
-        list_table(show_all=args.all, query=args.query)
+        list_table(show_all=args.all, query=args.query, limit=limit_val if limit_val > 0 else 999999)
         return
 
     # Direct session ID match (UUID prefix)
@@ -943,7 +1039,7 @@ def main():
     if shutil.which("fzf"):
         run_fzf_tui(initial_query=args.query, show_all=args.all)
     else:
-        run_rich_interactive_menu(initial_query=args.query, show_all=args.all)
+        run_rich_interactive_menu(initial_query=args.query, show_all=args.all, initial_limit=limit_val)
 
 
 if __name__ == "__main__":

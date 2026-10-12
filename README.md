@@ -83,12 +83,21 @@ claude-chats -a
 ### Non-Interactive & Quick Commands
 - **List conversations in a table:**
   ```bash
-  claude-chats --list     # or claude-chats -l
+  claude-chats --list         # or csess -l
+  claude-chats -l -n 50       # show 50 sessions
+  claude-chats -l -n all      # show all sessions
+  claude-chats -l "ODM"       # filter by keyword
+  ```
+
+- **Launch browser with custom session limit:**
+  ```bash
+  csess -n 50                 # show 50 sessions in browser
+  csess -n all                # show all sessions
   ```
 
 - **Resume the most recent conversation immediately:**
   ```bash
-  claude-chats -c         # or claude-chats --last
+  claude-chats -c             # or csess -c
   ```
 
 - **View full transcript of a specific conversation in your pager:**
@@ -103,7 +112,7 @@ claude-chats -a
 
 - **Unhide all SDK sessions in Claude's native `/resume` menu:**
   ```bash
-  claude-chats -u         # or claude-chats --unhide
+  claude-chats -u             # or csess -u
   ```
 
 ---
@@ -123,11 +132,15 @@ claude-chats -a
 ### In Rich Interactive Menu Mode:
 | Key / Command | Action |
 | :--- | :--- |
-| `1`-`N` | Enter session number to cd & resume |
+| `1`-`N` | Enter session number to `cd` & resume |
 | `p <#>` | Preview details of session |
-| `t <#>` | View full transcript in pager |
+| `t <#>` | View full turn-by-turn transcript |
 | `y <#>` | Copy session ID to clipboard |
+| `m` / `more` | Show more sessions (+25) |
+| `m all` | Show all available sessions |
+| `n <#>` | Set custom session display limit (e.g. `n 50`, `n all`) |
 | `/<text>` | Filter sessions by keyword |
+| `c` or `/` | Clear active search filter |
 | `a` | Toggle SDK/hidden sessions |
 | `u` | Unhide all SDK sessions in Claude |
 | `Enter` | Exit |
