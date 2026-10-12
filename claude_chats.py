@@ -645,8 +645,8 @@ def list_table(show_all=False, query="", limit=50):
     console.print()
 
 
-def run_fzf_tui(initial_query="", show_all=False):
-    """Runs interactive fuzzy finder using fzf."""
+def run_fzf_tui(initial_query="", show_all=False, limit=0):
+    """Runs interactive fuzzy finder using fzf with scrollable live preview."""
     script_path = os.path.abspath(__file__)
     current_show_all = show_all
 
@@ -655,6 +655,9 @@ def run_fzf_tui(initial_query="", show_all=False):
         if not sessions and not current_show_all:
             current_show_all = True
             sessions = query_sessions(show_all=True)
+
+        if limit > 0 and limit < len(sessions):
+            sessions = sessions[:limit]
 
         lines = []
         for s in sessions:
@@ -681,16 +684,20 @@ def run_fzf_tui(initial_query="", show_all=False):
         mode_str = "All Sessions (incl. SDK)" if current_show_all else "Main CLI Chats Only"
         header = (
             f"Mode: {mode_str}\n"
-            "ENTER: Resume Session | CTRL-T: Full Transcript | CTRL-Y: Copy ID | CTRL-A: Toggle All | CTRL-U: Unhide | ESC: Quit"
+            "ENTER: Resume Session | CTRL-T: Full Transcript | CTRL-Y: Copy ID | CTRL-A: Toggle All | ESC: Quit\n"
+            "Preview Scroll: Mouse Wheel / Shift-Up / Shift-Down / Ctrl-D / Ctrl-U"
         )
+
+        preview_cmd = f'"{sys.executable}" "{script_path}" --preview {{1}}'
 
         fzf_cmd = [
             "fzf",
             "--ansi",
             "--delimiter=\t",
             "--with-nth=2..",
-            f"--preview=python {script_path} --preview {{1}}",
-            "--preview-window=right:52%:wrap",
+            f"--preview={preview_cmd}",
+            "--preview-window=right:52%:wrap:border-rounded",
+            "--bind=ctrl-d:preview-page-down,ctrl-u:preview-page-up,ctrl-f:preview-page-down,ctrl-b:preview-page-up",
             f"--header={header}",
             "--prompt=Resume Claude Session > ",
             "--expect=ctrl-t,ctrl-y,ctrl-a,ctrl-u,enter",
@@ -707,7 +714,9 @@ def run_fzf_tui(initial_query="", show_all=False):
                 fzf_cmd,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                text=True
+                text=True,
+                encoding="utf-8",
+                errors="replace"
             )
             stdout, _ = proc.communicate(input=input_data)
         except FileNotFoundError:
@@ -978,6 +987,12 @@ def main():
         help="Number of sessions to show (e.g. 50, 100, or 'all', default: 25)"
     )
     parser.add_argument(
+        "--menu", "--rich",
+        dest="force_menu",
+        action="store_true",
+        help="Force numbered Rich table menu instead of fzf TUI"
+    )
+    parser.add_argument(
         "--preview",
         metavar="SID",
         help=argparse.SUPPRESS  # Internal flag for fzf preview
@@ -1035,9 +1050,9 @@ def main():
             resume_session(s["session_id"])
             return
 
-    # Interactive TUI
-    if shutil.which("fzf"):
-        run_fzf_tui(initial_query=args.query, show_all=args.all)
+    # Interactive TUI: use fzf with scrollable preview unless forced to menu or fzf missing
+    if shutil.which("fzf") and not args.force_menu:
+        run_fzf_tui(initial_query=args.query, show_all=args.all, limit=limit_val)
     else:
         run_rich_interactive_menu(initial_query=args.query, show_all=args.all, initial_limit=limit_val)
 

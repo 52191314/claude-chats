@@ -93,6 +93,7 @@ claude-chats -a
   ```bash
   csess -n 50                 # show 50 sessions in browser
   csess -n all                # show all sessions
+  csess --menu                # force numbered Rich menu instead of fzf
   ```
 
 - **Resume the most recent conversation immediately:**
@@ -127,6 +128,9 @@ claude-chats -a
 | `Ctrl-Y` | Copy session ID to system clipboard |
 | `Ctrl-A` | Toggle all sessions (including SDK sessions) |
 | `Ctrl-U` | Unhide all SDK sessions |
+| `Shift-Up` / `Shift-Down` | Scroll preview pane line by line |
+| `Ctrl-D` / `Ctrl-U` | Scroll preview pane half-page down / up |
+| `Mouse Wheel` | Scroll preview pane with mouse |
 | `Esc` / `Ctrl-C` | Exit cleanly without resuming |
 
 ### In Rich Interactive Menu Mode:
