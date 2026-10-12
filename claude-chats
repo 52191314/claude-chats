@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# claude-chats wrapper launcher
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+python3 "${SCRIPT_DIR}/claude_chats.py" "$@"
+
+# If resume script was generated, source/execute it to cd and launch claude
+RESUME_CMD_FILE="${HOME}/.claude_resume_cmd.sh"
+if [ -f "$RESUME_CMD_FILE" ]; then
+    CMD=$(cat "$RESUME_CMD_FILE")
+    rm -f "$RESUME_CMD_FILE"
+    eval "$CMD"
+fi
