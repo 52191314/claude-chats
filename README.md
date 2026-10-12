@@ -44,7 +44,7 @@ This symlinks / installs `claude-chats.bat`, `claude_chats.py`, and adds the Pow
 
 ### Option 2: Quick Install Script (Linux / macOS / WSL)
 ```bash
-git clone https://github.com/RAZOR-NINJAS/claude-chats.git
+git clone https://github.com/52191314/claude-chats.git
 cd claude-chats
 ./install.sh
 ```

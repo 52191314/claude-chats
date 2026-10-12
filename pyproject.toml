@@ -35,5 +35,5 @@ claude-history = "claude_chats:main"
 csess = "claude_chats:main"
 
 [project.urls]
-Homepage = "https://github.com/RAZOR-NINJAS/claude-chats"
-Repository = "https://github.com/RAZOR-NINJAS/claude-chats"
+Homepage = "https://github.com/52191314/claude-chats"
+Repository = "https://github.com/52191314/claude-chats"
