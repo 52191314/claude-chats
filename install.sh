@@ -17,6 +17,7 @@ ln -sf "${SCRIPT_DIR}/claude-chats" "${LOCAL_BIN}/claude-chats"
 ln -sf "${SCRIPT_DIR}/claude-chats" "${LOCAL_BIN}/claude-history"
 ln -sf "${SCRIPT_DIR}/claude-chats" "${LOCAL_BIN}/csess"
 ln -sf "${SCRIPT_DIR}/claude_chats.py" "${LOCAL_BIN}/claude_chats.py"
+ln -sf "${SCRIPT_DIR}/fzf_ui.py" "${LOCAL_BIN}/fzf_ui.py"
 
 echo "✔ Symlinked claude-chats, claude-history, and csess into ${LOCAL_BIN}"
 echo "Ensure ${LOCAL_BIN} is in your PATH."

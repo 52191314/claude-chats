@@ -19,6 +19,11 @@ from rich.console import Console
 from rich.table import Table
 from rich.panel import Panel
 
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+import fzf_ui  # fzf browser shell (shortcut bar + resume-commands area); same module as agy-chats
+
 # Ensure UTF-8 output on Windows consoles
 if hasattr(sys.stdout, "reconfigure"):
     try:
@@ -35,6 +40,7 @@ PROJECTS_DIR = os.path.expanduser(r"~/.claude/projects")
 CACHE_DB_PATH = os.path.expanduser(r"~/.claude/claude_chats_cache.db")
 RESUME_CMD_FILE = os.path.join(os.path.expanduser("~"), ".claude_resume_cmd.ps1")
 STATE_FILE = os.path.join(os.path.expanduser("~"), ".claude_chats_show_all")
+VIEW_STATE_FILE = os.path.join(os.path.expanduser("~"), ".claude_chats_preview_view")
 
 console = Console()
 
@@ -50,6 +56,49 @@ MAGENTA = "\033[35m"
 GRAY = "\033[90m"
 WHITE = "\033[97m"
 RED = "\033[31m"
+
+
+# ==============================================================================
+# Preview view state: which extras the preview shows (prompts are always shown)
+# ==============================================================================
+
+VIEW_KEYS = ("tools", "replies")
+_VIEW_DEFAULT = {"tools": True, "replies": False}
+PREVIEW_REPLY_MAX_LINES = 8
+TOOL_LABEL_MAX = 100
+
+
+def parse_view(spec):
+    """Parses a comma list like 'tools,replies' (empty string = prompts only)."""
+    wanted = {p.strip().lower() for p in (spec or "").split(",") if p.strip()}
+    return {k: (k in wanted) for k in VIEW_KEYS}
+
+
+def load_view():
+    """Loads the persisted preview view; falls back to defaults if missing or corrupt."""
+    view = dict(_VIEW_DEFAULT)
+    try:
+        with open(VIEW_STATE_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        for k in VIEW_KEYS:
+            if isinstance(data.get(k), bool):
+                view[k] = data[k]
+    except Exception:
+        pass
+    return view
+
+
+def toggle_view(key):
+    """Flips one preview switch ('tools' or 'replies'), persists it, and returns the new view."""
+    view = load_view()
+    if key in VIEW_KEYS:
+        view[key] = not view[key]
+        try:
+            with open(VIEW_STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump(view, f)
+        except Exception:
+            pass
+    return view
 
 
 def get_cache_db():
@@ -356,11 +405,148 @@ def get_session_by_id(session_id):
     return dict(row) if row else None
 
 
-def build_preview(session_id):
-    """Builds a formatted preview panel for fzf or interactive inspection."""
+_CMD_NAME_RE = re.compile(r"<command-name>(.*?)</command-name>", re.DOTALL)
+_CMD_ARGS_RE = re.compile(r"<command-args>(.*?)</command-args>", re.DOTALL)
+
+
+def preview_prompt_text(raw):
+    """Prompt text for the preview. Like clean_prompt_text(), but keeps '/command args' for slash
+    commands (clean_prompt_text strips <command-args>, which drops e.g. '/plan <the real request>')."""
+    if not raw:
+        return ""
+    m = _CMD_NAME_RE.search(raw)
+    if m:
+        args_m = _CMD_ARGS_RE.search(raw)
+        cmd_args = (args_m.group(1) if args_m else "").strip()
+        if not cmd_args:
+            return ""  # bare command like /model: not a prompt
+        return f"{m.group(1).strip()} {cmd_args}".strip()
+    return clean_prompt_text(raw)
+
+
+def _squash(text, limit):
+    """Collapses whitespace/newlines to single spaces and truncates."""
+    flat = " ".join(str(text).split())
+    return flat if len(flat) <= limit else flat[:limit - 3] + "..."
+
+
+def format_tool_label(name, tool_input):
+    """One-line label for a tool_use block, e.g. Bash(git status), Read(tui.py), Grep(pattern)."""
+    inp = tool_input if isinstance(tool_input, dict) else {}
+
+    def pick(*keys):
+        for k in keys:
+            v = inp.get(k)
+            if isinstance(v, str) and v.strip():
+                return v
+        return ""
+
+    if name in ("Bash", "PowerShell"):
+        arg = pick("command")
+    elif name in ("Read", "Edit", "Write", "MultiEdit", "NotebookEdit"):
+        path = pick("file_path", "notebook_path")
+        arg = os.path.basename(path.replace("\\", "/").rstrip("/")) or path
+    elif name in ("Grep", "Glob"):
+        arg = pick("pattern")
+    elif name in ("Agent", "Task"):
+        arg = pick("description", "prompt")
+    elif name == "WebFetch":
+        arg = pick("url")
+    elif name == "WebSearch":
+        arg = pick("query")
+    elif name == "Skill":
+        arg = pick("skill")
+    else:
+        arg = next((v for v in inp.values() if isinstance(v, str) and v.strip()), "")
+
+    if name.startswith("mcp__"):
+        parts = name.split("__")
+        name = f"{parts[1]}:{parts[-1]}" if len(parts) >= 3 else name
+    return f"{name}({_squash(arg, TOOL_LABEL_MAX)})"
+
+
+def load_turns(file_path):
+    """Reads a session JSONL into turns: {index, ts, prompt, events:[('reply', text) | ('tool', label)]}.
+    A turn starts at each real user prompt; replies and tool calls follow in the order they happened."""
+    turns = []
+    cur = None
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    d = json.loads(line)
+                except Exception:
+                    continue
+                if d.get("isSidechain") or d.get("isMeta") or d.get("isCompactSummary"):
+                    continue
+
+                stype = d.get("type")
+                content = (d.get("message") or {}).get("content", "")
+
+                if stype == "user":
+                    if isinstance(content, str):
+                        text = content
+                    elif isinstance(content, list):
+                        text = "\n".join(
+                            it.get("text", "") for it in content
+                            if isinstance(it, dict) and it.get("type") == "text" and it.get("text")
+                        )
+                    else:
+                        text = ""
+                    prompt = preview_prompt_text(text)
+                    if prompt and not prompt.startswith("[Request interrupted"):
+                        cur = {"index": len(turns) + 1, "ts": d.get("timestamp", ""), "prompt": prompt, "events": []}
+                        turns.append(cur)
+
+                elif stype == "assistant" and cur is not None:
+                    if isinstance(content, str):
+                        if content.strip():
+                            cur["events"].append(("reply", content.strip()))
+                    elif isinstance(content, list):
+                        for block in content:
+                            if not isinstance(block, dict):
+                                continue
+                            btype = block.get("type")
+                            if btype == "text":
+                                txt = (block.get("text") or "").strip()
+                                if txt:
+                                    cur["events"].append(("reply", txt))
+                            elif btype == "tool_use":
+                                cur["events"].append(
+                                    ("tool", format_tool_label(block.get("name", "Tool"), block.get("input")))
+                                )
+    except Exception:
+        pass
+    return turns
+
+
+def build_resume_cmd(s):
+    """Shell command that resumes a session in its original workspace (PowerShell-friendly)."""
+    cwd = (s["cwd"] or "").replace("'", "''")
+    return f"cd '{cwd}'; claude --resume {s['session_id']} --setting-sources project"
+
+
+def print_preview(text):
+    """Prints preview text (which already carries ANSI colors) with no Rich markup parsing or re-wrapping.
+    Prompts and tool labels can contain '[...]' that Rich would otherwise treat as markup."""
+    console.print(text, markup=False, highlight=False, emoji=False, soft_wrap=True)
+
+
+def build_preview(session_id, view=None):
+    """Builds a formatted preview panel for fzf or interactive inspection.
+
+    Prompts are always shown; view["tools"] / view["replies"] switch tool calls / assistant replies on or off.
+    """
     s = get_session_by_id(session_id)
     if not s:
         return f"{RED}Session {session_id} not found.{RESET}"
+    if view is None:
+        view = load_view()
+    show_tools = bool(view.get("tools"))
+    show_replies = bool(view.get("replies"))
 
     dt = datetime.fromtimestamp(s["mtime"])
     rel_time = format_relative_time(s["mtime"])
@@ -385,28 +571,52 @@ def build_preview(session_id):
     out.append(f"{BOLD}Active:{RESET}      {YELLOW}{rel_time}{RESET} {DIM}({exact_time}){RESET}")
     out.append(f"{BOLD}Stats:{RESET}       {BLUE}{s['user_turns_count']} user turns{RESET} • {CYAN}{s['total_steps']} steps{RESET} • {MAGENTA}{cost_str}{RESET}")
     out.append(f"{BOLD}Workspace:{RESET}   {GREEN}{disp_path}{RESET}")
+    chips = "  ".join(
+        f"{GREEN if on else GRAY}{'☑' if on else '☐'} {label}{RESET}"
+        for label, on in (("Tools", show_tools), ("Replies", show_replies))
+    )
+    out.append(f"{BOLD}View:{RESET}        {GREEN}☑ Prompts{RESET}  {chips}")
     out.append("")
 
-    if s["first_prompt"] and s["first_prompt"] != "(no user prompt)":
-        out.append(f"{BOLD}{YELLOW}▶ INITIAL USER REQUEST:{RESET}")
-        lines = s["first_prompt"].strip().splitlines()
-        for l in lines[:7]:
-            out.append(f"  {GRAY}│{RESET} {l}")
-        if len(lines) > 7:
-            out.append(f"  {GRAY}│ ... [{len(lines) - 7} more lines]{RESET}")
+    turns = load_turns(s["file_path"]) if os.path.exists(s["file_path"]) else []
+    if not turns:
+        out.append(f"{DIM}(no user prompts found in this session){RESET}")
         out.append("")
 
-    if s["last_reply"]:
-        out.append(f"{BOLD}{GREEN}▶ LATEST ASSISTANT RESPONSE:{RESET}")
-        lines = s["last_reply"].strip().splitlines()
-        for l in lines[:9]:
+    for turn in turns:
+        head = "▶ INITIAL USER REQUEST:" if turn["index"] == 1 else f"▶ USER TURN #{turn['index']}:"
+        out.append(f"{BOLD}{YELLOW}{head}{RESET}")
+        for l in turn["prompt"].splitlines():
             out.append(f"  {GRAY}│{RESET} {l}")
-        if len(lines) > 9:
-            out.append(f"  {GRAY}│ ... [{len(lines) - 9} more lines]{RESET}")
         out.append("")
+
+        if not (show_tools or show_replies):
+            continue
+
+        tool_no = 0
+        prev_kind = None
+        for kind, val in turn["events"]:
+            if kind == "tool":
+                tool_no += 1
+                if show_tools:
+                    out.append(f"  {CYAN}▸{RESET} {GRAY}#{tool_no}{RESET} {YELLOW}{val}{RESET}")
+                    prev_kind = "tool"
+            elif kind == "reply" and show_replies:
+                if prev_kind == "tool":
+                    out.append("")
+                out.append(f"{BOLD}{GREEN}▶ ASSISTANT:{RESET}")
+                reply_lines = val.splitlines()
+                for l in reply_lines[:PREVIEW_REPLY_MAX_LINES]:
+                    out.append(f"  {GRAY}│{RESET} {DIM}{l}{RESET}")
+                if len(reply_lines) > PREVIEW_REPLY_MAX_LINES:
+                    out.append(f"  {GRAY}│ … [{len(reply_lines) - PREVIEW_REPLY_MAX_LINES} more lines]{RESET}")
+                out.append("")
+                prev_kind = "reply"
+        if prev_kind == "tool":
+            out.append("")
 
     out.append(f"{GRAY}─────────────────────────────────────────────────────────────────────{RESET}")
-    out.append(f"{BOLD}Resume CLI:{RESET}  {CYAN}cd '{s['cwd']}' ; claude --resume {s['session_id']} --setting-sources project{RESET}")
+    out.append(f"{BOLD}Resume CLI:{RESET}  {CYAN}{build_resume_cmd(s)}{RESET}")
     return "\n".join(out)
 
 
@@ -564,26 +774,40 @@ def set_resume_command(session_id, cwd):
         console.print(f"[red]Failed to write resume command: {e}[/red]")
 
 
-def resume_session(session_id):
-    """Prepares and launches the resume command."""
+def resume_session(session_id, launch=False):
+    """Hands back the resume command for a session (and copies it).
+
+    With launch=True, instead queues the command for the PowerShell profile wrapper to run
+    (the old behavior), which cd's into the workspace and starts Claude.
+    """
     s = get_session_by_id(session_id)
     if not s:
         console.print(f"[red]Session {session_id} not found.[/red]")
         return
 
-    set_resume_command(s["session_id"], s["cwd"])
-    console.print(f"[bold green]Resuming session {s['session_id'][:8]} in {s['cwd']}...[/bold green]")
+    if launch:
+        set_resume_command(s["session_id"], s["cwd"])
+        console.print(f"[bold green]Resuming session {s['session_id'][:8]} in {s['cwd']}...[/bold green]")
+        return
+
+    cmd = build_resume_cmd(s)
+    copied = copy_to_clipboard(cmd)
+    console.print("[bold green]Resume command[/bold green]" + (" [dim](copied to clipboard)[/dim]" if copied else "") + ":\n")
+    # Plain write: console.print would wrap a long command and parse '[...]' as markup.
+    sys.stdout.write(cmd + "\n")
+    sys.stdout.flush()
+    return cmd
 
 
-def resume_latest():
-    """Resumes the most recently modified conversation."""
+def resume_latest(launch=False):
+    """Resumes (hands back the resume command for) the most recently modified conversation."""
     sessions = query_sessions(show_all=False)
     if not sessions:
         sessions = query_sessions(show_all=True)
     if not sessions:
         console.print("[red]No previous Claude conversations found.[/red]")
         sys.exit(1)
-    resume_session(sessions[0]["session_id"])
+    resume_session(sessions[0]["session_id"], launch=launch)
 
 
 def unhide_all_sessions():
@@ -645,120 +869,167 @@ def list_table(show_all=False, query="", limit=50):
     console.print()
 
 
-def run_fzf_tui(initial_query="", show_all=False, limit=0):
-    """Runs interactive fuzzy finder using fzf with scrollable live preview."""
-    script_path = os.path.abspath(__file__)
-    current_show_all = show_all
+# ==============================================================================
+# fzf shell: fzf in the top ~75% of the screen, shortcut bar + resume commands in the bottom ~25% (see fzf_ui.py)
+# ==============================================================================
 
-    while True:
-        sessions = query_sessions(show_all=current_show_all)
-        if not sessions and not current_show_all:
-            current_show_all = True
-            sessions = query_sessions(show_all=True)
+def build_fzf_items(state):
+    """fzf input for the session list, honoring state: show_all, limit (newest N) and group (by working folder)."""
+    show_all = bool(state.get("show_all"))
+    sessions = query_sessions(show_all=show_all)
+    if not sessions and not show_all:
+        sessions = query_sessions(show_all=True)
 
-        if limit > 0 and limit < len(sessions):
-            sessions = sessions[:limit]
-
-        lines = []
-        for s in sessions:
-            rel_time = format_relative_time(s["mtime"])
-            tag = "\033[31m[HIDDEN]\033[0m" if s["entrypoint"] == "sdk-cli" else "\033[32m●\033[0m"
-            short_id = s["session_id"][:8]
-            title = s["first_prompt"].replace("\n", " ").strip()
-            if len(title) > 38:
-                title = title[:35] + "..."
-            cwd_disp = format_path(s["cwd"])
-            cost_disp = f"${s['total_cost']:.2f}" if s["total_cost"] > 0 else "-"
-
-            display_col = (
-                f"{tag} \033[36m{short_id}\033[0m  "
-                f"\033[1;37m{title:<38}\033[0m  "
-                f"\033[33m{rel_time:<10}\033[0m  "
-                f"\033[32m{s['model']:<10}\033[0m  "
-                f"\033[35m{cost_disp:>7}\033[0m  "
-                f"\033[2m{cwd_disp}\033[0m"
-            )
-            lines.append(f"{s['session_id']}\t{display_col}")
-
-        input_data = "\n".join(lines)
-        mode_str = "All Sessions (incl. SDK)" if current_show_all else "Main CLI Chats Only"
-        header = (
-            f"Mode: {mode_str}\n"
-            "ENTER: Resume Session | CTRL-T: Full Transcript | CTRL-Y: Copy ID | CTRL-A: Toggle All | ESC: Quit\n"
-            "Preview Scroll: Mouse Wheel / Shift-Up / Shift-Down / Ctrl-D / Ctrl-U"
+    entries = []
+    for s in sessions:
+        rel_time = format_relative_time(s["mtime"])
+        tag = "\033[31m[HIDDEN]\033[0m" if s["entrypoint"] == "sdk-cli" else "\033[32m●\033[0m"
+        title = s["first_prompt"].replace("\n", " ").replace("\t", " ").strip()
+        if len(title) > 38:
+            title = title[:35] + "..."
+        cost_disp = f"${s['total_cost']:.2f}" if s["total_cost"] > 0 else "-"
+        display_col = (
+            f"{tag} \033[36m{s['session_id'][:8]}\033[0m  "
+            f"\033[1;37m{title:<38}\033[0m  "
+            f"\033[33m{rel_time:<10}\033[0m  "
+            f"\033[32m{s['model']:<10}\033[0m  "
+            f"\033[35m{cost_disp:>7}\033[0m  "
+            f"\033[2m{format_path(s['cwd'])}\033[0m"
         )
-
-        preview_cmd = f'"{sys.executable}" "{script_path}" --preview {{1}}'
-
-        fzf_cmd = [
-            "fzf",
-            "--ansi",
-            "--delimiter=\t",
-            "--with-nth=2..",
-            f"--preview={preview_cmd}",
-            "--preview-window=right:52%:wrap:border-rounded",
-            "--bind=ctrl-d:preview-page-down,ctrl-u:preview-page-up,ctrl-f:preview-page-down,ctrl-b:preview-page-up",
-            f"--header={header}",
-            "--prompt=Resume Claude Session > ",
-            "--expect=ctrl-t,ctrl-y,ctrl-a,ctrl-u,enter",
-            "--height=90%",
-            "--border=rounded",
-            "--info=inline",
-        ]
-        if initial_query:
-            fzf_cmd.append(f"--query={initial_query}")
-            initial_query = ""
-
-        try:
-            proc = subprocess.Popen(
-                fzf_cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace"
-            )
-            stdout, _ = proc.communicate(input=input_data)
-        except FileNotFoundError:
-            run_rich_interactive_menu(initial_query=initial_query, show_all=show_all)
-            return
-
-        if proc.returncode != 0 and not stdout:
-            return
-
-        out_lines = stdout.splitlines()
-        if not out_lines:
-            return
-
-        key = out_lines[0].strip() if len(out_lines) >= 2 else ""
-        selected_line = out_lines[1] if len(out_lines) >= 2 else out_lines[0]
-        session_id = selected_line.split("\t")[0].strip()
-
-        if key == "ctrl-a":
-            current_show_all = not current_show_all
-            continue
-        elif key == "ctrl-u":
-            unhide_all_sessions()
-            continue
-        elif key == "ctrl-t":
-            show_transcript_pager(session_id)
-            continue
-        elif key == "ctrl-y":
-            if copy_to_clipboard(session_id):
-                console.print(f"[bold green]✔ Copied session ID {session_id} to clipboard.[/bold green]")
-            else:
-                console.print(f"Session ID: {session_id}")
-            return
-        else:
-            resume_session(session_id)
-            return
+        cwd = s["cwd"] or ""
+        label = os.path.basename(cwd.rstrip("\\/")) or cwd or "(no workspace)"
+        entries.append((s["session_id"], display_col, cwd, label, format_path(cwd)))
+    return fzf_ui.assemble_items(entries, state)
 
 
-def run_rich_interactive_menu(initial_query="", show_all=False, initial_limit=25):
+def build_dir_preview(group_id):
+    """Overview of one working folder (the preview for a folder row in grouped mode)."""
+    sessions = [s for s in query_sessions(show_all=True) if (s["cwd"] or "") == group_id]
+    label = os.path.basename(group_id.rstrip("\\/")) or group_id or "(no workspace)"
+    total_cost = sum(s["total_cost"] for s in sessions)
+    total_turns = sum(s["user_turns_count"] for s in sessions)
+    out = [
+        f"{BOLD}{YELLOW}╭{'─' * (len(label) + 6)}╮{RESET}",
+        f"{BOLD}{YELLOW}│ ▼ {label} │{RESET}",
+        f"{BOLD}{YELLOW}╰{'─' * (len(label) + 6)}╯{RESET}",
+        "",
+        f"{BOLD}Folder:{RESET}      {CYAN}{group_id or '(none)'}{RESET}",
+        f"{BOLD}Sessions:{RESET}    {GREEN}{len(sessions)}{RESET}",
+        f"{BOLD}User turns:{RESET}  {BLUE}{total_turns}{RESET}",
+        f"{BOLD}Total cost:{RESET}  {MAGENTA}${total_cost:.2f} USD{RESET}",
+    ]
+    if sessions:
+        out.append(f"{BOLD}Last active:{RESET} {YELLOW}{format_relative_time(sessions[0]['mtime'])}{RESET}")
+    out += ["", f"{GRAY}─────────────────────────────────────────────────────────────────────{RESET}",
+            f"{BOLD}Sessions in this folder:{RESET}", ""]
+    for i, s in enumerate(sessions[:15], 1):
+        title = s["first_prompt"].replace("\n", " ").strip()
+        title = title if len(title) <= 34 else title[:31] + "..."
+        out.append(f" {GRAY}{i:2d}.{RESET} {CYAN}{s['session_id'][:6]}{RESET} {title:<34} {GRAY}{format_relative_time(s['mtime'])}{RESET}")
+    if len(sessions) > 15:
+        out.append(f"{DIM}  ... and {len(sessions) - 15} more{RESET}")
+    out += ["", f"{BOLD}{CYAN}Enter or Space folds / unfolds this folder.{RESET}"]
+    return "\n".join(out)
+
+
+def _h_trans(sid, st):
+    if sid and not fzf_ui.is_group(sid):
+        show_transcript_pager(sid)
+
+
+def _h_all(arg, st):
+    st["show_all"] = not st["show_all"]
+
+
+def _h_unhide(arg, st):
+    unhide_all_sessions()
+    try:
+        input("\nPress Enter to return to the browser...")
+    except (EOFError, KeyboardInterrupt):
+        pass
+
+
+def _h_launch(sid, st):
+    if not sid or fzf_ui.is_group(sid):
+        return None
+    resume_session(sid, launch=True)
+    return "quit"
+
+
+SHELL_HANDLERS = {
+    "trans": _h_trans,
+    "all": _h_all,
+    "unhide": _h_unhide,
+    "launch": _h_launch,
+}
+
+
+def _resume_cmd_for(sid):
+    s = get_session_by_id(sid) if sid else None
+    return build_resume_cmd(s) if s else None
+
+
+def make_shell_config(launch=False):
+    """The claude-chats flavor of the fzf shell: keys, shortcut bar, resume command."""
+    return fzf_ui.ShellConfig(
+        script=os.path.abspath(__file__),
+        title="claude-chats",
+        prompt="Resume Claude Session > ",
+        bar_items=[
+            ("Enter", "Copy Resume Cmd", "bold green"),
+            ("t", "Trans", "white"),
+            ("y", "Copy ID", "blue"),
+            ("a", "All/SDK", "yellow"),
+            ("u", "Unhide SDK", "magenta"),
+            ("g", "Group", "bold magenta"),
+            ("#", "Limit", "bold yellow"),
+            ("Space", "Fold/Unfold", "cyan", "group"),
+            ("e/c", "Expand/Collapse All", "cyan", "group"),
+            ("1", "Tools", "bold green"),
+            ("2", "Replies", "bold green"),
+            ("j/k", "Move", "dim"),
+            ("J/K", "Scroll Preview", "green"),
+            ("/", "Search", "white"),
+            ("q", "Quit", "bold red"),
+        ],
+        keys={
+            "t": "become(echo trans {1})",
+            "a": "become(echo all {1})",
+            "u": "become(echo unhide {1})",
+        },
+        resume_cmd=_resume_cmd_for,
+        copy=copy_to_clipboard,
+        launch=launch,
+    )
+
+
+def run_fzf_tui(initial_query="", show_all=False, limit=0, launch=False, group=False):
+    """Runs the fzf shell. Returns False when the console can't be driven (caller falls back to the Rich menu)."""
+    def header_for(st, count):
+        # one line inside the (narrow) list pane: keep it under ~70 columns or fzf truncates it
+        mode = "All (incl. SDK)" if st.get("show_all") else "Main CLI Chats Only"
+        lim = f"Top {st['limit']}" if st.get("limit") else "All"
+        grp = "ON" if st.get("group") else "OFF"
+        return f"{mode} | {count} sessions | Limit: {lim} [#] | Group: {grp} [g]"
+
+    return fzf_ui.run_shell(
+        make_shell_config(launch),
+        build_items=build_fzf_items,
+        header_for=header_for,
+        handlers=SHELL_HANDLERS,
+        show_all=show_all,
+        initial_query=initial_query,
+        limit=limit,
+        group=group,
+    )
+
+
+def run_rich_interactive_menu(initial_query="", show_all=False, initial_limit=25, launch=False):
     """Fallback interactive TUI using Rich when fzf is not installed."""
     current_show_all = show_all
     query = initial_query
     display_limit = initial_limit
+    last_cmd = ""  # most recent resume command handed out; re-shown under the actions so it stays visible
 
     while True:
         sessions = query_sessions(show_all=current_show_all, query=query)
@@ -841,12 +1112,17 @@ def run_rich_interactive_menu(initial_query="", show_all=False, initial_limit=25
         console.print(table)
 
         console.print("\n[bold yellow]Actions:[/bold yellow]")
-        console.print(f"  - Enter [bold green]1-{len(displayed)}[/bold green] to cd & resume session")
+        console.print(f"  - Enter [bold green]1-{len(displayed)}[/bold green] to copy the resume command for a session (menu stays open)")
         console.print("  - [bold cyan]p <#>[/bold cyan] Preview details  |  [bold cyan]t <#>[/bold cyan] Full transcript  |  [bold cyan]y <#>[/bold cyan] Copy ID")
+        console.print("  - [bold cyan]v tools[/bold cyan] / [bold cyan]v replies[/bold cyan] Toggle what [bold cyan]p <#>[/bold cyan] shows (prompts are always shown; [bold cyan]v[/bold cyan] = status)")
         more_hint = f"  |  [bold magenta]m[/bold magenta] More (+25)" if len(sessions) > len(displayed) else ""
         console.print(f"  - [bold magenta]/<text>[/bold magenta] Search filter    |  [bold magenta]a[/bold magenta] Toggle SDK chats{more_hint}")
         console.print("  - [bold magenta]n <#>[/bold magenta] Change limit (e.g. 'n 50' or 'n all')  |  [bold magenta]u[/bold magenta] Unhide all in Claude")
         console.print("  - Press [bold red]Enter[/bold red] to exit")
+        if last_cmd:
+            console.print("\n[bold green]Last resume command (copied):[/bold green]")
+            sys.stdout.write(last_cmd + "\n")
+            sys.stdout.flush()
 
         try:
             choice = input("\nSelect > ").strip()
@@ -887,6 +1163,21 @@ def run_rich_interactive_menu(initial_query="", show_all=False, initial_limit=25
             unhide_all_sessions()
             continue
 
+        # Preview view switches: 'v' (status), 'v tools', 'v replies'
+        if choice.lower() == "v" or choice.lower().startswith("v "):
+            which = choice[1:].strip().lower()
+            if which in VIEW_KEYS:
+                toggle_view(which)
+            elif which:
+                console.print(f"[red]Unknown view '{which}'. Use: v tools | v replies[/red]")
+            v = load_view()
+            console.print(
+                "[bold]Preview view:[/bold] [green]☑ Prompts[/green]  "
+                + ("[green]☑ Tools[/green]" if v["tools"] else "[dim]☐ Tools[/dim]") + "  "
+                + ("[green]☑ Replies[/green]" if v["replies"] else "[dim]☐ Replies[/dim]")
+            )
+            continue
+
         # Subcommands with number (e.g. p 1, t 1, y 1)
         parts = choice.split(maxsplit=1)
         cmd = parts[0].lower()
@@ -897,7 +1188,7 @@ def run_rich_interactive_menu(initial_query="", show_all=False, initial_limit=25
             if 1 <= idx <= len(displayed):
                 target_sid = displayed[idx - 1]["session_id"]
                 if cmd == "p":
-                    console.print(build_preview(target_sid))
+                    print_preview(build_preview(target_sid))
                     input("\nPress Enter to return to sessions list...")
                     continue
                 elif cmd == "t":
@@ -912,8 +1203,12 @@ def run_rich_interactive_menu(initial_query="", show_all=False, initial_limit=25
         if choice.isdigit():
             idx = int(choice)
             if 1 <= idx <= len(displayed):
-                resume_session(displayed[idx - 1]["session_id"])
-                return
+                if launch:
+                    resume_session(displayed[idx - 1]["session_id"], launch=True)
+                    return
+                # Hand back the command and keep the menu running
+                last_cmd = resume_session(displayed[idx - 1]["session_id"]) or last_cmd
+                continue
 
         console.print("[red]Invalid selection. Try again.[/red]")
 
@@ -987,6 +1282,11 @@ def main():
         help="Number of sessions to show (e.g. 50, 100, or 'all', default: 25)"
     )
     parser.add_argument(
+        "-g", "--group",
+        action="store_true",
+        help="Start the fzf browser grouped by working folder (toggle with 'g')"
+    )
+    parser.add_argument(
         "--menu", "--rich",
         dest="force_menu",
         action="store_true",
@@ -997,8 +1297,42 @@ def main():
         metavar="SID",
         help=argparse.SUPPRESS  # Internal flag for fzf preview
     )
+    parser.add_argument(
+        "--view",
+        metavar="LIST",
+        default=None,
+        help="With --preview / 'preview <id>': comma list of extras to show ('tools', 'replies'; '' = prompts only). Overrides the saved view."
+    )
+    parser.add_argument(
+        "--toggle-view",
+        choices=list(VIEW_KEYS),
+        default=None,
+        help=argparse.SUPPRESS  # Internal flag for fzf key bindings
+    )
+    parser.add_argument(
+        "--launch",
+        action="store_true",
+        help="Resume by queueing the command for the PowerShell wrapper to run (cd + claude) instead of just handing back the command"
+    )
+    # Internal: fzf key-binding callbacks (see fzf_ui.py)
+    parser.add_argument("--fzf-key", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--state", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--sel", default="", help=argparse.SUPPRESS)
 
     args = parser.parse_args(normalized_args)
+
+    # fzf key binding: flip a preview switch and exit (must not touch anything else)
+    if args.toggle_view:
+        toggle_view(args.toggle_view)
+        return
+
+    # fzf key-binding callback (modal keys, resume-commands area): prints the fzf action to run, if any.
+    if args.fzf_key:
+        out = fzf_ui.handle_key(make_shell_config(launch=args.launch), args.fzf_key, args.state, args.sel,
+                                copy_id=copy_to_clipboard)
+        sys.stdout.write(out)
+        sys.stdout.flush()
+        return
 
     # Parse limit value
     limit_val = 25
@@ -1018,11 +1352,15 @@ def main():
             pass
 
     # Helper subcommands
+    view_override = parse_view(args.view) if args.view is not None else None
+    if args.preview and fzf_ui.is_group(args.preview):
+        print_preview(build_dir_preview(fzf_ui.decode_group(args.preview)))   # folder row in grouped mode
+        return
     if args.preview:
-        console.print(build_preview(args.preview))
+        print_preview(build_preview(args.preview, view=view_override))
         return
     if args.query == "preview" and args.arg2:
-        console.print(build_preview(args.arg2))
+        print_preview(build_preview(args.arg2, view=view_override))
         return
     if args.query == "transcript" and args.arg2:
         show_transcript_pager(args.arg2)
@@ -1035,7 +1373,7 @@ def main():
 
     # Direct resume latest
     if args.resume_last:
-        resume_latest()
+        resume_latest(launch=args.launch)
         return
 
     # Direct list
@@ -1047,14 +1385,16 @@ def main():
     if args.query and not args.arg2 and re.match(r"^[0-9a-fA-F\-]{6,}$", args.query):
         s = get_session_by_id(args.query)
         if s:
-            resume_session(s["session_id"])
+            resume_session(s["session_id"], launch=args.launch)
             return
 
-    # Interactive TUI: use fzf with scrollable preview unless forced to menu or fzf missing
-    if shutil.which("fzf") and not args.force_menu:
-        run_fzf_tui(initial_query=args.query, show_all=args.all, limit=limit_val)
-    else:
-        run_rich_interactive_menu(initial_query=args.query, show_all=args.all, initial_limit=limit_val)
+    # Interactive TUI: the fzf shell (preview + shortcut bar + resume-commands area) unless forced to the menu,
+    # fzf is missing, or there is no console to drive
+    if shutil.which("fzf") and not args.force_menu and sys.stdout.isatty():
+        if run_fzf_tui(initial_query=args.query, show_all=args.all, limit=limit_val, launch=args.launch,
+                       group=args.group):
+            return
+    run_rich_interactive_menu(initial_query=args.query, show_all=args.all, initial_limit=limit_val, launch=args.launch)
 
 
 if __name__ == "__main__":

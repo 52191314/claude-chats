@@ -11,10 +11,11 @@ if (!(Test-Path $localBin)) {
 }
 
 # 1. Copy CLI files to ~/.local/bin
-Copy-Item (Join-Path $scriptDir "claude_chats.py") (Join-Path $localBin "claude_chats.py") -Force
-Copy-Item (Join-Path $scriptDir "claude-chats.bat") (Join-Path $localBin "claude-chats.bat") -Force
-Copy-Item (Join-Path $scriptDir "claude-chats.bat") (Join-Path $localBin "claude-history.bat") -Force
-Copy-Item (Join-Path $scriptDir "claude-chats.bat") (Join-Path $localBin "csess.bat") -Force
+# Launchers point at this repo (no copies to go stale): edits to claude_chats.py / fzf_ui.py are live immediately.
+$launcher = "@echo off`r`npython `"$scriptDir\claude_chats.py`" %*`r`n"
+foreach ($n in "claude-chats", "claude-history", "csess") {
+    [IO.File]::WriteAllText((Join-Path $localBin "$n.bat"), $launcher, [Text.Encoding]::ASCII)
+}
 
 Write-Host "[+] Copied scripts to $localBin" -ForegroundColor Green
 
@@ -56,7 +57,10 @@ if ($currentProfile -notmatch "function claude-chats") {
     }
     Write-Host "[+] Configured claude-chats and csess in PowerShell profile ($profilePath)" -ForegroundColor Green
 } else {
-    Set-Content -Path $profilePath -Value $functionSnippet.Trim() -Encoding UTF8
+    # Replace ONLY the existing function block (never the whole profile - it may hold other things).
+    $functionBlock = ($functionLines[2..13] -join "`r`n")
+    $updated = [regex]::Replace($currentProfile, "(?ms)^function claude-chats\s*\{.*?^\}", { param($m) $functionBlock })
+    Set-Content -Path $profilePath -Value $updated -Encoding UTF8
     Write-Host "[+] Updated claude-chats function in PowerShell profile ($profilePath)" -ForegroundColor Green
 }
 

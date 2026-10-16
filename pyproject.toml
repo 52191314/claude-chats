@@ -29,6 +29,9 @@ dependencies = [
     "pyperclip>=1.8.0",
 ]
 
+[tool.setuptools]
+py-modules = ["claude_chats", "fzf_ui"]
+
 [project.scripts]
 claude-chats = "claude_chats:main"
 claude-history = "claude_chats:main"
